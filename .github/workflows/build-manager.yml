@@ -35,77 +35,115 @@ on:
       - 'userspace/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
+  workflow_dispatch:
   workflow_call:
 
 jobs:
+  # The certificate MUST be selected before the kernel module is built.
+  # A build without repository signing secrets uses a per-run throwaway key.
   generate-key:
     runs-on: ubuntu-latest
     outputs:
-      expected_size: ${{ steps.extract.outputs.expected_size }}
-      expected_hash: ${{ steps.extract.outputs.expected_hash }}
-      keystore: ${{ steps.gen.outputs.keystore }}
-      keystore_password: ${{ steps.gen.outputs.keystore_password }}
-      key_password: ${{ steps.gen.outputs.key_password }}
+      package_name: ${{ steps.package.outputs.package_name }}
+      mode: ${{ steps.sign.outputs.mode }}
+      expected_size: ${{ steps.sign.outputs.expected_size }}
+      expected_hash: ${{ steps.sign.outputs.expected_hash }}
+      keystore: ${{ steps.sign.outputs.keystore }}
+      keystore_password: ${{ steps.sign.outputs.keystore_password }}
+      key_password: ${{ steps.sign.outputs.key_password }}
     steps:
-      - name: Generate temporary keystore
-        if: github.event_name == 'pull_request'
-        id: gen
+      - name: Checkout package name configuration
+        uses: actions/checkout@v7
+
+      - name: Read manager package name from Gradle
+        id: package
+        shell: bash
         run: |
-          KEYSTORE_PASSWORD=$(openssl rand -hex 32)
-          KEY_PASSWORD=$(openssl rand -hex 32)
-          echo "keystore_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
-          echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          python3 - <<'PYCODE' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import os
+          import re
 
-          keytool -genkeypair \
-            -alias pr-key \
-            -keyalg RSA -keysize 2048 \
-            -validity 1 \
-            -storepass "$KEYSTORE_PASSWORD" \
-            -keypass "$KEY_PASSWORD" \
-            -dname "CN=KernelSU PR Build" \
-            -storetype JKS \
-            -keystore pr-key.jks
+          gradle = Path('manager/app/build.gradle.kts').read_text(encoding='utf-8')
+          match = re.search(
+              r'val defaultManagerPackageName\s*=\s*if\s*\(isPrBuild\)\s*"([a-zA-Z_][a-zA-Z_0-9.]*)"\s*else\s*"([a-zA-Z_][a-zA-Z_0-9.]*)"',
+              gradle,
+          )
+          if not match:
+              raise SystemExit('Cannot read manager package name from build.gradle.kts')
+          package = match.group(1) if os.environ['GITHUB_EVENT_NAME'] == 'pull_request' else match.group(2)
+          print(f'package_name={package}')
+          print(f'Manager package: {package}', file=__import__('sys').stderr)
+          PYCODE
 
-          echo "keystore=$(base64 -w 0 pr-key.jks)" >> $GITHUB_OUTPUT
-
-      - name: Extract certificate hash and size
-        if: github.event_name == 'pull_request'
-        id: extract
+      - name: Select signing key and read certificate identity
+        id: sign
+        shell: bash
         env:
-          STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          # Export DER certificate
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" && -n "$PROD_KEYSTORE" && -n "$PROD_KEYSTORE_PASSWORD" && -n "$PROD_KEY_ALIAS" && -n "$PROD_KEY_PASSWORD" ]]; then
+            # Never expose the production keystore or passwords via job outputs/artifacts.
+            printf '%s' "$PROD_KEYSTORE" | base64 -d > ci-key.jks
+            KEY_ALIAS="$PROD_KEY_ALIAS"
+            STORE_PASS="$PROD_KEYSTORE_PASSWORD"
+            echo "mode=persistent" >> "$GITHUB_OUTPUT"
+          else
+            if [[ "$GITHUB_EVENT_NAME" != "pull_request" && ( -n "$PROD_KEYSTORE" || -n "$PROD_KEYSTORE_PASSWORD" || -n "$PROD_KEY_ALIAS" || -n "$PROD_KEY_PASSWORD" ) ]]; then
+              echo '::error::Set ALL four signing secrets (KEYSTORE, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD), or none for an ephemeral CI build.'
+              exit 1
+            fi
+            KEY_ALIAS='ci-key'
+            STORE_PASS="$(openssl rand -hex 24)"
+            keytool -genkeypair \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 \
+              -validity 3650 \
+              -storetype JKS \
+              -keystore ci-key.jks \
+              -storepass "$STORE_PASS" \
+              -keypass "$STORE_PASS" \
+              -dname 'CN=KernelSU CI Build'
+            echo "mode=temporary" >> "$GITHUB_OUTPUT"
+            echo "keystore=$(base64 -w 0 ci-key.jks)" >> "$GITHUB_OUTPUT"
+            echo "keystore_password=$STORE_PASS" >> "$GITHUB_OUTPUT"
+            echo "key_password=$STORE_PASS" >> "$GITHUB_OUTPUT"
+            echo '::warning::Using a NEW signing certificate for this run. Configure all four signing secrets for upgradable releases.'
+          fi
+
           keytool -exportcert \
-            -alias pr-key \
-            -keystore pr-key.jks \
+            -alias "$KEY_ALIAS" \
+            -keystore ci-key.jks \
             -storepass "$STORE_PASS" \
-            -file pr-cert.der
-
-          # Calculate size in hex
-          SIZE_DEC=$(stat -c%s pr-cert.der)
-          SIZE_HEX=$(printf '0x%04x' "$SIZE_DEC")
-          echo "expected_size=$SIZE_HEX" >> $GITHUB_OUTPUT
-
-          # Calculate SHA256 hash
-          HASH=$(sha256sum pr-cert.der | awk '{print $1}')
-          echo "expected_hash=$HASH" >> $GITHUB_OUTPUT
-
-          echo "Certificate size: $SIZE_HEX ($SIZE_DEC bytes)"
-          echo "Certificate hash: $HASH"
+            -file ci-cert.der
+          SIZE_DEC="$(stat -c%s ci-cert.der)"
+          # kernel/manager/apk_sign.c has a 1024-byte DER certificate limit.
+          if (( SIZE_DEC > 1024 )); then
+            echo "::error::Signing certificate ($SIZE_DEC bytes) exceeds kernel verification limit (1024)."
+            exit 1
+          fi
+          printf 'expected_size=0x%04x\n' "$SIZE_DEC" >> "$GITHUB_OUTPUT"
+          echo "expected_hash=$(sha256sum ci-cert.der | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
   build-lkm:
     needs: generate-key
     uses: ./.github/workflows/build-lkm.yml
     with:
-      expected_size: ${{ needs.generate-key.outputs.expected_size || '' }}
-      expected_hash: ${{ needs.generate-key.outputs.expected_hash || '' }}
+      package_name: ${{ needs.generate-key.outputs.package_name }}
+      expected_size: ${{ needs.generate-key.outputs.expected_size }}
+      expected_hash: ${{ needs.generate-key.outputs.expected_hash }}
     secrets: inherit
 
   build-ksuinit:
     uses: ./.github/workflows/ksuinit.yml
 
   build-ksud:
-    needs: [build-lkm, build-ksuinit]
+    needs: [generate-key, build-lkm, build-ksuinit]
     strategy:
       matrix:
         include:
@@ -115,6 +153,7 @@ jobs:
     uses: ./.github/workflows/ksud.yml
     with:
       target: ${{ matrix.target }}
+      package_name: ${{ needs.generate-key.outputs.package_name }}
       pack_lkm: true
       pack_ksuinit: true
   
@@ -154,33 +193,43 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Write key
-        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' )) || github.ref_type == 'tag' }}
-        run: |
-          if [ ! -z "${{ secrets.KEYSTORE }}" ]; then
-            {
-              echo KEYSTORE_PASSWORD='${{ secrets.KEYSTORE_PASSWORD }}'
-              echo KEY_ALIAS='${{ secrets.KEY_ALIAS }}'
-              echo KEY_PASSWORD='${{ secrets.KEY_PASSWORD }}'
-              echo KEYSTORE_FILE='key.jks'
-            } >> gradle.properties
-            echo "${{ secrets.KEYSTORE }}" | base64 -d > key.jks
-          fi
-
-      - name: Write PR key
-        if: github.event_name == 'pull_request'
+      - name: Prepare matching signing key for Gradle
+        shell: bash
         env:
-          PR_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
-          PR_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
-          PR_KEY_PASSWORD: ${{ needs.generate-key.outputs.key_password }}
+          SIGN_MODE: ${{ needs.generate-key.outputs.mode }}
+          TEMP_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
+          TEMP_STORE_PASS: ${{ needs.generate-key.outputs.keystore_password }}
+          TEMP_KEY_PASS: ${{ needs.generate-key.outputs.key_password }}
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "$PR_KEYSTORE" | base64 -d > pr-key.jks
+          set -euo pipefail
+          if [[ "$SIGN_MODE" == 'temporary' ]]; then
+            printf '%s' "$TEMP_KEYSTORE" | base64 -d > key.jks
+            KEY_ALIAS='ci-key'
+            STORE_PASS="$TEMP_STORE_PASS"
+            KEY_PASS="$TEMP_KEY_PASS"
+          elif [[ "$SIGN_MODE" == 'persistent' ]]; then
+            printf '%s' "$PROD_KEYSTORE" | base64 -d > key.jks
+            KEY_ALIAS="$PROD_KEY_ALIAS"
+            STORE_PASS="$PROD_KEYSTORE_PASSWORD"
+            KEY_PASS="$PROD_KEY_PASSWORD"
+          else
+            echo "::error::Unknown signing mode: $SIGN_MODE"
+            exit 1
+          fi
+          test -s key.jks
+          echo "::add-mask::$STORE_PASS"
+          echo "::add-mask::$KEY_PASS"
+          # ORG_GRADLE_PROJECT_* avoids putting passwords into tracked files.
           {
-            echo KEYSTORE_PASSWORD="$PR_KEYSTORE_PASSWORD"
-            echo KEY_ALIAS='pr-key'
-            echo KEY_PASSWORD="$PR_KEY_PASSWORD"
-            echo KEYSTORE_FILE='pr-key.jks'
-          } >> gradle.properties
+            echo 'ORG_GRADLE_PROJECT_KEYSTORE_FILE=key.jks'
+            echo "ORG_GRADLE_PROJECT_KEYSTORE_PASSWORD=$STORE_PASS"
+            echo "ORG_GRADLE_PROJECT_KEY_ALIAS=$KEY_ALIAS"
+            echo "ORG_GRADLE_PROJECT_KEY_PASSWORD=$KEY_PASS"
+          } >> "$GITHUB_ENV"
 
       - name: Setup Java
         uses: actions/setup-java@v6
@@ -200,7 +249,6 @@ jobs:
           fi
 
       - name: Upload build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
         uses: actions/upload-artifact@v7
         with:
           name: manager-gradle
@@ -277,49 +325,49 @@ jobs:
           cp -f "$X86_64_KSUD" target/x86_64-linux-android/release/ksud
           cp -f "$RISCV64_KSUD" target/riscv64-linux-android/release/ksud
 
-      - name: Prepare signing inputs
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+      - name: Repack and sign with the matching certificate
+        shell: bash
         env:
-          PR_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
-          PR_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
-          PR_KEY_PASSWORD: ${{ needs.generate-key.outputs.key_password }}
+          SIGN_MODE: ${{ needs.generate-key.outputs.mode }}
+          TEMP_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
+          TEMP_STORE_PASS: ${{ needs.generate-key.outputs.keystore_password }}
+          TEMP_KEY_PASS: ${{ needs.generate-key.outputs.key_password }}
           PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
           PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          PROD_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "$PR_KEYSTORE" | base64 -d > pr-key.jks
-            echo "SIGN_KEYSTORE_FILE=pr-key.jks" >> $GITHUB_ENV
-            echo "SIGN_KEY_ALIAS=pr-key" >> $GITHUB_ENV
-            echo "SIGN_KEYSTORE_PASSWORD=$PR_KEYSTORE_PASSWORD" >> $GITHUB_ENV
-            echo "SIGN_KEY_PASSWORD=$PR_KEY_PASSWORD" >> $GITHUB_ENV
+          set -euo pipefail
+          if [[ "$SIGN_MODE" == 'temporary' ]]; then
+            printf '%s' "$TEMP_KEYSTORE" | base64 -d > ci-key.jks
+            KEY_ALIAS='ci-key'
+            STORE_PASS="$TEMP_STORE_PASS"
+            KEY_PASS="$TEMP_KEY_PASS"
+          elif [[ "$SIGN_MODE" == 'persistent' ]]; then
+            printf '%s' "$PROD_KEYSTORE" | base64 -d > ci-key.jks
+            KEY_ALIAS="$PROD_KEY_ALIAS"
+            STORE_PASS="$PROD_STORE_PASS"
+            KEY_PASS="$PROD_KEY_PASS"
           else
-            test -n "$PROD_KEYSTORE"
-            echo "$PROD_KEYSTORE" | base64 -d > key.jks
-            echo "SIGN_KEYSTORE_FILE=key.jks" >> $GITHUB_ENV
-            echo "SIGN_KEY_ALIAS=$PROD_KEY_ALIAS" >> $GITHUB_ENV
-            echo "SIGN_KEYSTORE_PASSWORD=$PROD_KEYSTORE_PASSWORD" >> $GITHUB_ENV
-            echo "SIGN_KEY_PASSWORD=$PROD_KEY_PASSWORD" >> $GITHUB_ENV
+            echo "::error::Unknown signing mode: $SIGN_MODE"
+            exit 1
           fi
-
-      - name: Repack and resign
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
-        run: |
+          test -s ci-key.jks
+          echo "::add-mask::$STORE_PASS"
+          echo "::add-mask::$KEY_PASS"
           python3 repack_apk.py repack \
             -b release \
             -t release \
             -a arm64-v8a \
             -a x86_64 \
             -a riscv64 \
-            -K "$SIGN_KEYSTORE_FILE" \
-            -A "$SIGN_KEY_ALIAS" \
-            -P "$SIGN_KEYSTORE_PASSWORD" \
-            -S "$SIGN_KEY_PASSWORD" \
+            -K ci-key.jks \
+            -A "$KEY_ALIAS" \
+            -P "$STORE_PASS" \
+            -S "$KEY_PASS" \
             --strip
 
       - name: Upload build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
         uses: actions/upload-artifact@v7
         with:
           name: manager
